@@ -141,13 +141,18 @@
         let dragPlane; 
         let jointBody, mouseConstraint; 
         let isDragging = false;
+
+        // --- Hover Highlight (selection outline) ---
+        const hoverOutline = { enabled: false };
+        let hoverBoxMesh = null;
+        let hoveredBlockIndex = -1;
         
         // --- NETWORKING & TURN-BASED STATES ---
         let peer, conn;
         let isHost = true; 
         let myColor = 'Red'; // Host is Red, Client is Blue
         let currentTurn = 'Red'; 
-        let isGameOver = false;
+
 
 
         // --- 1. NETWORKING (PeerJS) & UI INTERACTION ---
@@ -274,18 +279,13 @@
                     }
                 }
 
-                // Match State Updates
+            // Match State Updates
                 if (data.type === 'switch_turn') switchTurn();
                 if (data.type === 'reset_game') resetGameUI(); 
                 if (isHost && data.type === 'request_reset') resetGame(); 
 
-                // ADD THIS CASE HERE
-                if (data.type === 'game_over') {
-                    isGameOver = true;
-                    displayGameOverUI(data.loser);
-                }
-                
                 // HOST EXECUTION LAYER: Resolves physics operations requested by client
+
                 if (isHost) {
                     if (data.type === 'client_down') handleClientDown(data);
                     if (data.type === 'client_move') handleClientMove(data);
@@ -437,6 +437,7 @@
             const shape = new CANNON.Box(new CANNON.Vec3(blockWidth/2, blockHeight/2, blockLength/2));
             const levels = 10;
 
+
             for (let i = 0; i < levels; i++) {
                 for (let j = 0; j < 3; j++) {
                     const mesh = new THREE.Mesh(blockGeo, blockMat);
@@ -474,68 +475,7 @@
             }
         }
 
-        // --- GAME OVER LOGIC (Host authoritative) ---
-        function checkGameOver() {
-            // Only the host evaluates physics, and only if the game isn't already over/settling
-            if (!isHost || isGameOver || isSettling) return;
 
-            for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
-                const block = blocks[blockIndex];
-
-                // Only check blocks that are NOT on the base layer
-                if (block.isBaseLayer) continue;
-
-                // Threshold for "fallen to ground"
-                const fellToGround = block.body.position.y < 0.26;
-
-                // Threshold for "slid out of bounds" (optional, kept from your previous logic)
-                const slidOutOfBounds = Math.abs(block.body.position.x) > 2.5 ||
-                                        Math.abs(block.body.position.z) > 2.5;
-
-                if (fellToGround || slidOutOfBounds) {
-                    const reason = fellToGround ? 'fellToGround (y < 0.26)' : 'slidOutOfBounds';
-
-                    console.debug(`[JENGA][GAME_OVER] Block ${blockIndex} failed: ${reason}`, {
-                        position: block.body.position,
-                        turn: currentTurn
-                    });
-
-                    // The player whose turn it is is penalized for the tower's state
-                    triggerGameOver(currentTurn);
-                    break;
-                }
-            }
-        }
-
-        function triggerGameOver(loserColor) {
-            isGameOver = true;
-
-            // Sever any active dragging constraint immediately
-            handleClientUp();
-
-            // Trigger visual pop-up message
-            setTimeout(() => {
-                alert(`GAME OVER! The player controlling ${loserColor.toUpperCase()} caused the tower to collapse.`);
-            }, 100);
-
-            // Update local UI
-            displayGameOverUI(loserColor);
-
-            // Broadcast the game over event to the peer client
-            if (conn && conn.open) {
-                conn.send({ type: 'game_over', loser: loserColor });
-            }
-        }
-
-        function displayGameOverUI(loserColor) {
-            const indicator = document.getElementById('turn-indicator');
-            indicator.innerText = `GAME OVER! ${loserColor.toUpperCase()} LOST!`;
-            indicator.className = `turn-text ${loserColor === 'Red' ? 'red' : 'blue'}`;
-
-            // Change screen border to solid red indicating defeat
-            document.body.className = '';
-            document.body.style.boxShadow = 'inset 0 0 50px 20px rgba(255, 0, 0, 0.8)';
-        }
 
         // --- 4. GAME LOOP ---
         let lastSentAt = 0;
@@ -544,9 +484,6 @@
 
             if (isHost) {
                 world.step(1 / 60);
-
-                // ADD THIS LINE HERE
-                checkGameOver();
 
                 const positions = [];
                 const quaternions = [];
@@ -565,6 +502,18 @@
                 }
             }
 
+            // Keep hover outline attached to the hovered block.
+            if (hoverBoxMesh && hoveredBlockIndex !== -1) {
+                const block = blocks[hoveredBlockIndex];
+                if (block) {
+                    hoverBoxMesh.position.copy(block.mesh.position);
+                    hoverBoxMesh.quaternion.copy(block.mesh.quaternion);
+                    // scale is handled in setHoverOutlineForBlock()
+                    hoverBoxMesh.visible = true;
+                }
+            }
+
+
             controls.update();
             renderer.render(scene, camera);
         }
@@ -578,7 +527,53 @@
         }
 
         function canInteract() {
-            return currentTurn === myColor && !isGameOver; // Block pointer logic if out-of-turn or after defeat
+            return currentTurn === myColor;
+        }
+
+        function setHoverOutlineForBlock(blockIndex) {
+            if (blockIndex === hoveredBlockIndex) return;
+            hoveredBlockIndex = blockIndex;
+
+            if (hoverBoxMesh) {
+                if (blockIndex === -1) {
+                    hoverBoxMesh.visible = false;
+                    return;
+                }
+            }
+
+            const block = blocks[blockIndex];
+            if (!block) {
+                if (hoverBoxMesh) hoverBoxMesh.visible = false;
+                return;
+            }
+
+            if (!hoverBoxMesh) {
+                // Create a thin outline box using BoxGeometry wireframe.
+                const geom = new THREE.BoxGeometry(1, 1, 1);
+                const mat = new THREE.MeshBasicMaterial({ color: 0xffeb3b, wireframe: true });
+                hoverBoxMesh = new THREE.Mesh(geom, mat);
+                hoverBoxMesh.visible = true;
+                scene.add(hoverBoxMesh);
+            }
+
+            // Match block mesh transform (position/quaternion) and scale to its geometry.
+            // We keep scale in world space by using the mesh's current scale.
+            hoverBoxMesh.position.copy(block.mesh.position);
+            hoverBoxMesh.quaternion.copy(block.mesh.quaternion);
+            hoverBoxMesh.scale.copy(block.mesh.scale);
+
+            // Use the block mesh size based on its bounding box.
+            if (!block.mesh.geometry.boundingBox) block.mesh.geometry.computeBoundingBox();
+            const size = new THREE.Vector3();
+            block.mesh.geometry.boundingBox.getSize(size);
+            // Our hover box geometry is unit-sized; set scale to match real size.
+            hoverBoxMesh.scale.set(size.x, size.y, size.z);
+
+            hoverBoxMesh.visible = true;
+        }
+
+        function clearHoverOutline() {
+            setHoverOutlineForBlock(-1);
         }
 
         function onPointerDown(event) {
@@ -620,10 +615,31 @@
         }
 
         function onPointerMove(event) {
-            if (!isDragging || !canInteract()) return;
-
             mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
             mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            // Update hover outline when not dragging.
+            if (!isDragging) {
+                if (!canInteract()) {
+                    clearHoverOutline();
+                    return;
+                }
+
+                raycaster.setFromCamera(mouse, camera);
+                const meshArray = blocks.map(b => b.mesh);
+                const intersects = raycaster.intersectObjects(meshArray, false);
+                if (intersects.length === 0) {
+                    clearHoverOutline();
+                    return;
+                }
+
+                const hitMesh = intersects[0].object;
+                const idx = blocks.findIndex(b => b.mesh === hitMesh);
+                setHoverOutlineForBlock(idx === -1 ? -1 : idx);
+                return;
+            }
+
+            if (!canInteract()) return;
 
             raycaster.setFromCamera(mouse, camera);
             const intersects = raycaster.intersectObject(dragPlane, false);
@@ -646,6 +662,7 @@
 
             isDragging = false;
             controls.enabled = true;
+            clearHoverOutline();
 
             if (isHost) {
                 handleClientUp();
