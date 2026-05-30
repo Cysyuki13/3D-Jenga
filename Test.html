@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>P2P 3D Jenga - Turn Based</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; transition: box-shadow 0.3s; }
+        /* Visual turn indicators around the frame of the browser screen */
+        body.turn-red { box-shadow: inset 0 0 20px 10px rgba(255, 0, 0, 0.4); }
+        body.turn-blue { box-shadow: inset 0 0 20px 10px rgba(0, 0, 255, 0.4); }
+        
+        canvas { display: block; }
+
+        /* Floating pop-out toggle button */
+        #menu-toggle-btn {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            z-index: 100;
+            padding: 10px 15px;
+            background: white;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+
+        #copy-id-btn {
+            margin-top: 10px;
+            background: #444;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        #copy-id-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        /* Modern pop-out sidebar menu */
+        #ui { 
+            position: absolute; 
+            top: 0; 
+            left: -320px; /* Hidden offscreen on the left side by default */
+            width: 280px; 
+            height: 100%;
+            background: rgba(255,255,255,0.95); 
+            padding: 20px; 
+            box-shadow: 4px 0 15px rgba(0,0,0,0.3);
+            transition: left 0.3s ease;
+            z-index: 99;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+        
+        /* Class added dynamically via JS to open menu */
+        #ui.open {
+            left: 0;
+        }
+
+        /* Close button inside pop-out menu */
+        #menu-close-btn {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background: none;
+            border: none;
+            font-size: 1.5em;
+            cursor: pointer;
+            color: #555;
+        }
+        #menu-close-btn:hover { color: #000; }
+
+        button, input { 
+            width: 100%;
+            padding: 10px; 
+            margin-top: 8px; 
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        
+        #connect-btn, #end-turn-btn, #reset-btn {
+            background: #333;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        #connect-btn:hover, #end-turn-btn:hover, #reset-btn:hover { background: #555; }
+
+        #game-controls { display: none; margin-top: 20px; border-top: 1px solid #ccc; padding-top: 15px; }
+        .turn-text { font-weight: bold; font-size: 1.2em; margin-bottom: 10px; text-align: center; }
+        .red { color: #d32f2f; }
+        .blue { color: #1976d2; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+<body class="turn-red">
+    <button id="menu-toggle-btn">☰ Open Menu</button>
+
+    <div id="ui"> <button id="menu-close-btn">✕</button>
+        <h3>Jenga P2P</h3>
+        <div id="my-id">Generating ID...</div>
+        <button id="copy-id-btn" disabled>Copy ID</button>
+        <input type="text" id="peer-id-input" placeholder="Enter Friend's ID">
+        <button id="connect-btn">Connect (Join Game)</button>
+        <p id="status">Status: Disconnected</p>
+
+        <div id="game-controls">
+            <div id="turn-indicator" class="turn-text red">Current Turn: RED (Host)</div>
+            <button id="end-turn-btn">End Turn</button>
+            <button id="reset-btn">Reset Game</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import * as CANNON from 'cannon-es';
+
+        // --- GLOBAL VARIABLES ---
+        let scene, camera, renderer, controls;
+        let world;
+        const blocks = []; // Array to store { mesh, body, initialPos, initialQuat } objects
+
+        // --- INTERACTION GLOBALS ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        let dragPlane; 
+        let jointBody, mouseConstraint; 
+        let isDragging = false;
+        
+        // --- NETWORKING & TURN-BASED STATES ---
+        let peer, conn;
+        let isHost = true; 
+        let myColor = 'Red'; // Host is Red, Client is Blue
+        let currentTurn = 'Red'; 
+        let isGameOver = false;
+
+
+        // --- 1. NETWORKING (PeerJS) & UI INTERACTION ---
+        function initNetwork() {
+            peer = new Peer();
+
+            const copyBtn = document.getElementById('copy-id-btn');
+            let myPeerId = '';
+
+            function setCopyButtonState(enabled, label) {
+                copyBtn.disabled = !enabled;
+                if (label) copyBtn.innerText = label;
+            }
+
+            async function copyToClipboard(text) {
+                if (!text) return false;
+
+                // Prefer async clipboard API
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        return true;
+                    } catch (e) {
+                        // fall back below
+                    }
+                }
+
+                // Fallback for older browsers / restricted contexts
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                ta.style.top = '-9999px';
+                document.body.appendChild(ta);
+                ta.focus();
+                ta.select();
+                try {
+                    const ok = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    return ok;
+                } catch (e) {
+                    document.body.removeChild(ta);
+                    return false;
+                }
+            }
+
+            copyBtn.addEventListener('click', async () => {
+                if (!myPeerId) return;
+
+                const prev = copyBtn.innerText;
+                const ok = await copyToClipboard(myPeerId);
+
+                if (ok) {
+                    setCopyButtonState(true, 'Copied!');
+                    setTimeout(() => setCopyButtonState(true, prev === 'Copied!' ? 'Copy ID' : prev), 900);
+                } else {
+                    setCopyButtonState(true, 'Copy failed');
+                    setTimeout(() => setCopyButtonState(true, 'Copy ID'), 1200);
+                }
+            });
+
+            peer.on('open', (id) => {
+                myPeerId = id;
+                document.getElementById('my-id').innerText = `Your ID: ${id}`;
+                setCopyButtonState(true, 'Copy ID');
+            });
+
+            peer.on('connection', (connection) => {
+                conn = connection;
+                isHost = true;
+                myColor = 'Red';
+                setupConnection('Connected to Client! (You are RED)');
+            });
+
+            document.getElementById('connect-btn').addEventListener('click', () => {
+                const friendId = document.getElementById('peer-id-input').value;
+                if (!friendId) return;
+                
+                conn = peer.connect(friendId);
+                isHost = false; 
+                myColor = 'Blue';
+                setupConnection('Connected to Host! (You are BLUE)');
+            });
+
+            // Pop-out Menu toggle UI bindings
+            document.getElementById('menu-toggle-btn').addEventListener('click', () => {
+                document.getElementById('ui').classList.toggle('open');
+            });
+            document.getElementById('menu-close-btn').addEventListener('click', () => {
+                document.getElementById('ui').classList.remove('open');
+            });
+
+            // Turn-Based actions
+            document.getElementById('end-turn-btn').addEventListener('click', () => {
+                if (currentTurn === myColor && conn && conn.open) {
+                    switchTurn();
+                    conn.send({ type: 'switch_turn' });
+                }
+            });
+
+            document.getElementById('reset-btn').addEventListener('click', () => {
+                if (isHost) {
+                    resetGame();
+                    if (conn && conn.open) conn.send({ type: 'reset_game' });
+                } else {
+                    if (conn && conn.open) conn.send({ type: 'request_reset' });
+                }
+            });
+        }
+
+        function setupConnection(statusText) {
+            document.getElementById('status').innerText = `Status: ${statusText}`;
+            document.getElementById('game-controls').style.display = 'block';
+            updateTurnUI();
+            
+            conn.on('data', (data) => {
+                // Sync Physics (Client reads incoming stream from Host)
+                if (!isHost && data.type === 'physics_sync') {
+                    for (let i = 0; i < data.positions.length; i++) {
+                        if (blocks[i]) {
+                            blocks[i].mesh.position.copy(data.positions[i]);
+                            blocks[i].mesh.quaternion.copy(data.quaternions[i]);
+                        }
+                    }
+                }
+
+                // Match State Updates
+                if (data.type === 'switch_turn') switchTurn();
+                if (data.type === 'reset_game') resetGameUI(); 
+                if (isHost && data.type === 'request_reset') resetGame(); 
+
+                // ADD THIS CASE HERE
+                if (data.type === 'game_over') {
+                    isGameOver = true;
+                    displayGameOverUI(data.loser);
+                }
+                
+                // HOST EXECUTION LAYER: Resolves physics operations requested by client
+                if (isHost) {
+                    if (data.type === 'client_down') handleClientDown(data);
+                    if (data.type === 'client_move') handleClientMove(data);
+                    if (data.type === 'client_up') handleClientUp();
+                }
+            });
+        }
+
+        // --- MATCH MANAGER LOGIC ---
+        function switchTurn() {
+            currentTurn = (currentTurn === 'Red') ? 'Blue' : 'Red';
+            updateTurnUI();
+            
+            // Break active pulls instantly if a turn wraps up mid-drag
+            if (isHost && mouseConstraint) {
+                handleClientUp();
+            }
+        }
+
+        function updateTurnUI() {
+            const indicator = document.getElementById('turn-indicator');
+            indicator.innerText = `Current Turn: ${currentTurn.toUpperCase()}`;
+            indicator.className = `turn-text ${currentTurn.toLowerCase()}`;
+            document.body.className = `turn-${currentTurn.toLowerCase()}`;
+        }
+
+        function resetGame() {
+            if (!isHost) return;
+
+            if (mouseConstraint) {
+                world.removeConstraint(mouseConstraint);
+                mouseConstraint = null;
+            }
+
+            isGameOver = false; // Reset flag
+            document.body.style.boxShadow = ''; // Reset UI glow
+            
+            // Map all rigid bodies straight back to original structural stack offsets
+            for (let block of blocks) {
+                block.body.position.copy(block.initialPos);
+                block.body.quaternion.copy(block.initialQuat);
+                block.body.velocity.setZero();
+                block.body.angularVelocity.setZero();
+                block.body.wakeUp();
+            }
+
+            startSettlePhase();
+            
+            currentTurn = 'Red';
+            updateTurnUI();
+            if (conn && conn.open) conn.send({ type: 'reset_game' });
+        }
+
+        function resetGameUI() {
+            isGameOver = false; // Reset flag
+            document.body.style.boxShadow = ''; // Reset UI glow
+            currentTurn = 'Red';
+            updateTurnUI();
+        }
+
+        // --- 2. 3D GRAPHICS (Three.js) ---
+        function initGraphics() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87ceeb);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(10, 15, 15);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0x404040, 2);
+            scene.add(ambientLight);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(10, 20, 10);
+            dirLight.castShadow = true;
+            scene.add(dirLight);
+
+            const floorGeo = new THREE.PlaneGeometry(50, 50);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+            const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+            floorMesh.rotation.x = -Math.PI / 2;
+            floorMesh.receiveShadow = true;
+            scene.add(floorMesh);
+
+            const planeGeo = new THREE.PlaneGeometry(100, 100);
+            const planeMat = new THREE.MeshBasicMaterial({ visible: false });
+            dragPlane = new THREE.Mesh(planeGeo, planeMat);
+            scene.add(dragPlane);
+        }
+
+        // --- 3. PHYSICS (Cannon-es) & JENGA TOWER ---
+        function initPhysics() {
+            world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+            world.allowSleep = true;
+            world.defaultContactMaterial = new CANNON.ContactMaterial(
+                new CANNON.Material('default'), new CANNON.Material('default'),
+                { friction: 0.8, restitution: 0.0 }
+            );
+
+            const woodMaterial = new CANNON.Material('wood');
+            const woodWoodContact = new CANNON.ContactMaterial(woodMaterial, woodMaterial, {
+                friction: 0.8, restitution: 0.0
+            });
+            world.addContactMaterial(woodWoodContact);
+
+            const floorBody = new CANNON.Body({
+                type: CANNON.Body.STATIC,
+                shape: new CANNON.Plane(),
+            });
+            floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+            world.addBody(floorBody);
+
+            jointBody = new CANNON.Body({ mass: 0 });
+            jointBody.collisionFilterGroup = 0; 
+            jointBody.collisionFilterMask = 1;  
+            world.addBody(jointBody);
+
+            createTower(woodMaterial);
+            startSettlePhase();
+        }
+
+        let isSettling = false;
+        function startSettlePhase() {
+            isSettling = true;
+            const settleSteps = Math.floor(2 * 60);
+            for (let i = 0; i < settleSteps; i++) {
+                world.step(1 / 60);
+            }
+
+            for (let block of blocks) {
+                block.mesh.position.copy(block.body.position);
+                block.mesh.quaternion.copy(block.body.quaternion);
+                block.body.allowSleep = true;
+                block.body.sleepSpeedLimit = 0.1;
+                block.body.sleepTimeLimit = 1.0;
+            }
+            isSettling = false;
+        }
+
+        function createTower(material) {
+            const blockWidth = 1, blockHeight = 0.5, blockLength = 3, mass = 1;
+            const blockGeo = new THREE.BoxGeometry(blockWidth, blockHeight, blockLength);
+            const blockMat = new THREE.MeshStandardMaterial({ color: 0xd2a679 });
+            const shape = new CANNON.Box(new CANNON.Vec3(blockWidth/2, blockHeight/2, blockLength/2));
+            const levels = 10;
+
+            for (let i = 0; i < levels; i++) {
+                for (let j = 0; j < 3; j++) {
+                    const mesh = new THREE.Mesh(blockGeo, blockMat);
+                    mesh.castShadow = true;
+                    mesh.receiveShadow = true;
+
+                    const body = new CANNON.Body({ mass, shape, material });
+                    let x, y, z;
+                    y = (blockHeight / 2) + i * blockHeight;
+
+                    if (i % 2 === 0) {
+                        x = (j - 1) * 1.05; z = 0;
+                        body.quaternion.setFromEuler(0, 0, 0);
+                    } else {
+                        x = 0; z = (j - 1) * 1.05;
+                        body.quaternion.setFromEuler(0, Math.PI / 2, 0);
+                    }
+                    mesh.quaternion.copy(body.quaternion);
+                    mesh.position.set(x, y, z);
+                    body.position.set(x, y, z);
+
+                    body.allowSleep = true;
+                    body.sleepSpeedLimit = 0.1;
+                    body.sleepTimeLimit = 1.0;
+
+                    // Cache baseline positions for Reset routines
+                    const initialPos = new CANNON.Vec3(x, y, z);
+                    const initialQuat = new CANNON.Quaternion().copy(body.quaternion);
+
+                    scene.add(mesh);
+                    world.addBody(body);
+                    // ADD THIS: Track if the block is on the base layer (level i === 0)
+                    blocks.push({ mesh, body, initialPos, initialQuat, isBaseLayer: (i === 0) });
+                }
+            }
+        }
+
+        // --- GAME OVER LOGIC (Host authoritative) ---
+        function checkGameOver() {
+            // Only the host evaluates physics, and only if the game isn't already over/settling
+            if (!isHost || isGameOver || isSettling) return;
+
+            for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+                const block = blocks[blockIndex];
+
+                // Only check blocks that are NOT on the base layer
+                if (block.isBaseLayer) continue;
+
+                // Threshold for "fallen to ground"
+                const fellToGround = block.body.position.y < 0.26;
+
+                // Threshold for "slid out of bounds" (optional, kept from your previous logic)
+                const slidOutOfBounds = Math.abs(block.body.position.x) > 2.5 ||
+                                        Math.abs(block.body.position.z) > 2.5;
+
+                if (fellToGround || slidOutOfBounds) {
+                    const reason = fellToGround ? 'fellToGround (y < 0.26)' : 'slidOutOfBounds';
+
+                    console.debug(`[JENGA][GAME_OVER] Block ${blockIndex} failed: ${reason}`, {
+                        position: block.body.position,
+                        turn: currentTurn
+                    });
+
+                    // The player whose turn it is is penalized for the tower's state
+                    triggerGameOver(currentTurn);
+                    break;
+                }
+            }
+        }
+
+        function triggerGameOver(loserColor) {
+            isGameOver = true;
+
+            // Sever any active dragging constraint immediately
+            handleClientUp();
+
+            // Trigger visual pop-up message
+            setTimeout(() => {
+                alert(`GAME OVER! The player controlling ${loserColor.toUpperCase()} caused the tower to collapse.`);
+            }, 100);
+
+            // Update local UI
+            displayGameOverUI(loserColor);
+
+            // Broadcast the game over event to the peer client
+            if (conn && conn.open) {
+                conn.send({ type: 'game_over', loser: loserColor });
+            }
+        }
+
+        function displayGameOverUI(loserColor) {
+            const indicator = document.getElementById('turn-indicator');
+            indicator.innerText = `GAME OVER! ${loserColor.toUpperCase()} LOST!`;
+            indicator.className = `turn-text ${loserColor === 'Red' ? 'red' : 'blue'}`;
+
+            // Change screen border to solid red indicating defeat
+            document.body.className = '';
+            document.body.style.boxShadow = 'inset 0 0 50px 20px rgba(255, 0, 0, 0.8)';
+        }
+
+        // --- 4. GAME LOOP ---
+        let lastSentAt = 0;
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (isHost) {
+                world.step(1 / 60);
+
+                // ADD THIS LINE HERE
+                checkGameOver();
+
+                const positions = [];
+                const quaternions = [];
+
+                for (let block of blocks) {
+                    block.mesh.position.copy(block.body.position);
+                    block.mesh.quaternion.copy(block.body.quaternion);
+                    positions.push(block.body.position);
+                    quaternions.push(block.body.quaternion);
+                }
+
+                const now = performance.now();
+                if (!isSettling && conn && conn.open && now - lastSentAt > 33) { 
+                    lastSentAt = now;
+                    conn.send({ type: 'physics_sync', positions: positions, quaternions: quaternions });
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // --- 5. INTERACTION (Raycasting & RPC Architecture) ---
+        function initInteraction() {
+            window.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerup', onPointerUp);
+            window.addEventListener('pointercancel', onPointerUp);
+        }
+
+        function canInteract() {
+            return currentTurn === myColor && !isGameOver; // Block pointer logic if out-of-turn or after defeat
+        }
+
+        function onPointerDown(event) {
+            if (!canInteract()) return;
+            if (event.button !== undefined && event.button !== 0) return;
+            
+            // Stop clicks targeting UI elements or pop-out wrappers from running raycasting
+            if (event.target.closest('#ui') || event.target.closest('#menu-toggle-btn')) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const meshArray = blocks.map(b => b.mesh);
+            const intersects = raycaster.intersectObjects(meshArray, false);
+
+            if (intersects.length === 0) return;
+
+            controls.enabled = false;
+            isDragging = true;
+
+            const hitMesh = intersects[0].object;
+            const hitPoint = intersects[0].point;
+            
+            // Safeguard clamp for instant clicks
+            hitPoint.y = Math.max(0.25, hitPoint.y);
+
+            const blockIndex = blocks.findIndex(b => b.mesh === hitMesh);
+            if (blockIndex === -1) return;
+
+            dragPlane.position.copy(hitPoint);
+            dragPlane.quaternion.copy(camera.quaternion);
+
+            if (isHost) {
+                handleClientDown({ blockIndex, hitPoint });
+            } else {
+                conn.send({ type: 'client_down', blockIndex, hitPoint });
+            }
+        }
+
+        function onPointerMove(event) {
+            if (!isDragging || !canInteract()) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(dragPlane, false);
+            if (!intersects.length) return;
+
+            const hitPoint = intersects[0].point;
+            
+            // FIX: Clamp coordinate Y so mouse pull target can never go lower than ground-clearance block centers (0.25)
+            hitPoint.y = Math.max(0.25, hitPoint.y);
+
+            if (isHost) {
+                handleClientMove({ hitPoint });
+            } else {
+                conn.send({ type: 'client_move', hitPoint });
+            }
+        }
+
+        function onPointerUp() {
+            if (!isDragging || !canInteract()) return;
+
+            isDragging = false;
+            controls.enabled = true;
+
+            if (isHost) {
+                handleClientUp();
+            } else {
+                conn.send({ type: 'client_up' });
+            }
+        }
+
+        // --- HOST PHYSICS EVENT HANDLERS ---
+        function handleClientDown(data) {
+            const block = blocks[data.blockIndex];
+            if (!block) return;
+
+            const safeY = Math.max(0.25, data.hitPoint.y);
+            const hitPointVec = new CANNON.Vec3(data.hitPoint.x, safeY, data.hitPoint.z);
+
+            // 1. Move our tracking physics anchor handle directly to where the cursor clicked
+            jointBody.position.copy(hitPointVec);
+            block.body.wakeUp();
+            jointBody.wakeUp();
+
+            // 2. FIX: Convert the world hit point into a relative local space vector on the block body.
+            // This prevents the anchor from snapping violently to the center of the block mesh.
+            const localPivot = new CANNON.Vec3();
+            block.body.pointToLocalFrame(hitPointVec, localPivot);
+
+            // 3. Bind the local surface coordinate to our tracking handle
+            mouseConstraint = new CANNON.PointToPointConstraint(
+                block.body, localPivot,
+                jointBody, new CANNON.Vec3(0, 0, 0)
+            );
+            world.addConstraint(mouseConstraint);
+        }
+
+        function handleClientMove(data) {
+            const safeY = Math.max(0.25, data.hitPoint.y);
+            jointBody.position.set(data.hitPoint.x, safeY, data.hitPoint.z);
+            jointBody.wakeUp();
+        }
+
+        function handleClientUp() {
+            if (mouseConstraint) {
+                world.removeConstraint(mouseConstraint);
+                mouseConstraint = null;
+            }
+        }
+
+        // --- INITIALIZATION ---
+        initNetwork();
+        initGraphics();
+        initPhysics();
+        initInteraction();
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
